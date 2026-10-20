@@ -1,27 +1,31 @@
-"""Build the tiered competition split from the raw multi-species table.
+"""Build the tiered competition splits from the bacterial transcriptomics data.
 
-The whole split lives here (the benchmark only *loads* the result). One
-``build_split`` code path serves both:
+Processes raw or sample multi-species CSV tables:
+- ``read_count_{debug|train|global}.csv``
+- ``feature_annotation_{debug|train|global}.csv``
+- ``condition_annotation_{debug|train|global}.csv``
+- optional ``gbff/`` or ``genomes/`` directory.
 
-- ``python tools/setup_data.py``          — real data (fill ``load_raw`` +
-  the species tiers below with the assembled files);
-- ``python tools/setup_data.py --demo``   — a tiny synthetic dataset in the
-  exact on-disk layout, to exercise the loader and the Codabench pipeline
-  end-to-end with no real data.
+Modes:
+- ``debug``: small subsample for debugging, simulates A, B, C, D splits.
+- ``train``: available training data, simulates A, B, C, D splits.
+- ``full`` : final evaluation data, uses pre-existing A, B, C, D labels.
 
-Tiers (see ``design.md``):
-- TRAIN         : training species, L-shaped region (not double-held-out).
-- PUBLIC        : training species, ``feature_split==test AND
-                  condition_split==test`` (new gene x new condition).
-- PRIVATE near  : held-out species close to a training species.
-- PRIVATE far   : held-out species far in phylogeny.
-
-Leakage guards enforced below: (1) genes cut at the ortholog-group level so a
-"new gene" is genuinely novel; (2) whole studies held out for conditions;
-(3) normalization offsets are per-observation (never test-set aggregates).
+Outputs the layout read by ``BacterialExpression`` dataset:
+    <out_dir>/<mode>/
+      train_data.tsv
+      feature_annotations.tsv
+      condition_annotations.tsv
+      A/{test_data.tsv, labels.csv}
+      B/{test_data.tsv, labels.csv}
+      C/{test_data.tsv, labels.csv}
+      D/{test_data.tsv, labels.csv}
+      genomes/ (optional .gbff / .gb files)
 """
 
 import argparse
+import math
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -29,220 +33,403 @@ import pandas as pd
 
 OUT_DIR = Path("phases/main/input_data/data/gene_expression")
 
-# Fill these with the real references (genome accessions) once the data lands.
-TRAIN_SPECIES = ["GCF_train"]
-NEAR_SPECIES = ["GCF_near"]
-FAR_SPECIES = ["GCF_far"]
-
-OBS_COLS = ["Geneid", "run_accession", "reference", "Chr", "Start", "End",
-            "Strand", "Length", "log_length_ratio", "log_size_factor",
-            "feature_split", "condition_split"]
-
-
-def _held_out_block(obs):
-    return ((obs["feature_split"] == "test")
-            & (obs["condition_split"] == "test"))
-
-
-def build_split(obs):
-    """Partition a raw long table into the four tiers.
-
-    ``obs`` is one row per (gene x sample) observation with at least the
-    columns in ``OBS_COLS`` plus ``counts`` and (for guard 1) an
-    ``ortholog_group`` and (for guard 2) a ``study`` column.
-    """
-    in_train = obs["reference"].isin(TRAIN_SPECIES)
-    block = _held_out_block(obs)
-
-    train = obs[in_train & ~block].copy()
-    public = obs[in_train & block].copy()
-    near = obs[obs["reference"].isin(NEAR_SPECIES)].copy()
-    far = obs[obs["reference"].isin(FAR_SPECIES)].copy()
-    near["group"] = "near"
-    far["group"] = "far"
-    private = pd.concat([near, far], ignore_index=True)
-
-    _check_leakage(obs, train, public, private)
-    return train, public, private
+STATUS_RULES = pd.DataFrame(
+    [
+        ("train", "train", "Train"),
+        ("test_partial", "train", "Train"),
+        ("train", "test_partial", "Train"),
+        ("test_partial", "test_partial", "A"),
+        ("test_partial", "test_full", "B"),
+        ("train", "test_full", "B"),
+        ("test_full", "test_partial", "C"),
+        ("test_full", "train", "C"),
+        ("test_full", "test_full", "D"),
+    ],
+    columns=["feature_status", "run_status", "status"],
+)
 
 
-def _check_leakage(obs, train, public, private):
-    """Fail loudly if a split leaks across the intended boundaries.
-
-    The public block is the L-shape's ``test-gene x test-condition`` corner, so
-    a test-gene *does* appear in train (under train conditions) and a
-    test-condition *does* appear in train (for train genes) — that is the
-    design. What must not leak is a (gene x sample) *cell*, and the split
-    labels must be consistent per gene / per study.
-    """
-    # Guard 1: feature_split is a property of the gene (ortholog group).
-    if "ortholog_group" in obs.columns:
-        bad = obs.groupby("ortholog_group")["feature_split"].nunique()
-        assert (bad <= 1).all(), (
-            "feature_split varies within an ortholog group "
-            "(guard 1: the gene set partition must be gene-level)."
-        )
-    # Guard 2: condition_split is a property of the study (study holdout).
-    if "study" in obs.columns:
-        bad = obs.groupby("study")["condition_split"].nunique()
-        assert (bad <= 1).all(), (
-            "condition_split varies within a study "
-            "(guard 2: hold out whole studies for the condition axis)."
-        )
-    # No (gene x sample) cell shared between train and public.
-    cell = ["Geneid", "run_accession"]
-    shared = train[cell].merge(public[cell], on=cell)
-    assert shared.empty, (
-        f"{len(shared)} (gene x sample) cells shared by train and public.")
-    # Public is exactly the double-held-out block on the training species.
-    assert _held_out_block(public).all(), "public has non-held-out rows."
-    assert not _held_out_block(train).any(), "train has held-out-block rows."
-    assert not (set(train["reference"]) & set(private["reference"])), (
-        "train and private share a species."
+def _find_file(data_dir: Path, candidate_names: list) -> Path:
+    for name in candidate_names:
+        p = data_dir / name
+        if p.is_file():
+            return p
+    raise FileNotFoundError(
+        f"Could not find any of {candidate_names} in {data_dir}"
     )
 
 
-def write_layout(out_dir, train, public, private, samples, genomes_src=None):
-    """Write the on-disk layout the ``Bacteria`` dataset reads."""
+def simulate_splits(
+    feat_df: pd.DataFrame, cond_df: pd.DataFrame, seed: int = 42
+):
+    """Simulate test_partial and test_full splits for debug/train modes.
+
+    Rule:
+    - 20% randomly selected conditions: 80% test_partial, 20% test_full.
+      Remaining 80% conditions: train.
+    - 20% randomly selected features: 80% test_partial, 20% test_full.
+      Remaining 80% features: train.
+    """
+    # 1. Conditions
+    cond_df = cond_df.copy()
+    n_cond = len(cond_df)
+    n_test_cond = int(round(0.20 * n_cond))
+    test_cond_idx = cond_df.sample(n=n_test_cond, random_state=seed).index
+
+    n_full_cond = int(round(0.20 * n_test_cond))
+    if n_test_cond > 0 and n_full_cond == 0 and 0.20 * n_test_cond > 0:
+        n_full_cond = 1
+    test_full_cond_idx = (
+        cond_df.loc[test_cond_idx]
+        .sample(n=n_full_cond, random_state=seed)
+        .index
+    )
+    test_partial_cond_idx = test_cond_idx.difference(test_full_cond_idx)
+
+    cond_df["status"] = "train"
+    cond_df.loc[test_partial_cond_idx, "status"] = "test_partial"
+    cond_df.loc[test_full_cond_idx, "status"] = "test_full"
+
+    # 2. Features
+    feat_df = feat_df.copy()
+    n_feat = len(feat_df)
+    n_test_feat = int(round(0.20 * n_feat))
+    test_feat_idx = feat_df.sample(n=n_test_feat, random_state=seed).index
+
+    n_full_feat = int(round(0.20 * n_test_feat))
+    if n_test_feat > 0 and n_full_feat == 0 and 0.20 * n_test_feat > 0:
+        n_full_feat = 1
+    test_full_feat_idx = (
+        feat_df.loc[test_feat_idx]
+        .sample(n=n_full_feat, random_state=seed)
+        .index
+    )
+    test_partial_feat_idx = test_feat_idx.difference(test_full_feat_idx)
+
+    feat_df["status"] = "train"
+    feat_df.loc[test_partial_feat_idx, "status"] = "test_partial"
+    feat_df.loc[test_full_feat_idx, "status"] = "test_full"
+
+    return feat_df, cond_df
+
+
+def load_raw_data(
+    data_dir: Path = Path("data"), mode: str = "debug", seed: int = 42
+):
+    """Load and merge tables using pandas."""
+    if mode == "debug":
+        rc_cands = [
+            "read_count_debug.csv",
+            "baseline_read_count_global.csv",
+            "read_count.csv",
+        ]
+        feat_cands = [
+            "feature_annotation_debug.csv",
+            "baseline_feature_annotation_global.csv",
+        ]
+        cond_cands = [
+            "condition_annotation_debug.csv",
+            "baseline_condition_annotation_global.csv",
+        ]
+    elif mode == "train":
+        rc_cands = ["read_count_train.csv", "read_count.csv"]
+        feat_cands = ["feature_annotation_train.csv", "feature_annotation.csv"]
+        cond_cands = [
+            "condition_annotation_train.csv",
+            "condition_annotation.csv",
+        ]
+    elif mode == "full":
+        rc_cands = [
+            "read_count_global.csv",
+            "baseline_read_count_global.csv",
+            "read_count.csv",
+        ]
+        feat_cands = [
+            "feature_annotation_global.csv",
+            "baseline_feature_annotation_global.csv",
+        ]
+        cond_cands = [
+            "condition_annotation_global.csv",
+            "baseline_condition_annotation_global.csv",
+        ]
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    rc_file = _find_file(data_dir, rc_cands)
+    feat_file = _find_file(data_dir, feat_cands)
+    cond_file = _find_file(data_dir, cond_cands)
+
+    rc_df = pd.read_csv(rc_file)
+    feat_df = pd.read_csv(feat_file)
+    cond_df = pd.read_csv(cond_file)
+
+    if mode in ("debug", "train"):
+        feat_df, cond_df = simulate_splits(feat_df, cond_df, seed=seed)
+
+    # Build unique identifiers
+    rc_df["gene_uid"] = (
+        rc_df["genome_id"].astype(str) + "_" + rc_df["feature_id"].astype(str)
+    )
+    rc_df["condition_uid"] = (
+        rc_df["genome_id"].astype(str)
+        + "_"
+        + rc_df["run_accession"].astype(str)
+    )
+
+    # Prepare feature annotations for merge
+    feat_cols = [
+        c for c in feat_df.columns if c not in ("species", "ref_species")
+    ]
+    feat_merge = feat_df[feat_cols].copy()
+    if "status" in feat_merge.columns:
+        feat_merge = feat_merge.rename(columns={"status": "feature_status"})
+
+    # Prepare condition annotations for merge
+    cond_cols = [c for c in cond_df.columns if c not in ("species",)]
+    cond_merge = cond_df[cond_cols].copy()
+    if "status" in cond_merge.columns:
+        cond_merge = cond_merge.rename(columns={"status": "run_status"})
+
+    # Clean existing status columns in rc_df for debug/train simulation
+    if mode in ("debug", "train"):
+        cols_to_drop = [
+            c
+            for c in ("feature_status", "run_status", "status")
+            if c in rc_df.columns
+        ]
+        if cols_to_drop:
+            rc_df = rc_df.drop(columns=cols_to_drop)
+
+    # Merge feature metadata
+    feat_overlap = [
+        c
+        for c in feat_merge.columns
+        if c in rc_df.columns and c not in ("genome_id", "feature_id")
+    ]
+    if feat_overlap:
+        feat_merge = feat_merge.drop(columns=feat_overlap)
+    merged_df = rc_df.merge(
+        feat_merge, on=["genome_id", "feature_id"], how="left"
+    )
+
+    # Merge condition metadata
+    cond_overlap = [
+        c
+        for c in cond_merge.columns
+        if c in merged_df.columns and c not in ("genome_id", "run_accession")
+    ]
+    if cond_overlap:
+        cond_merge = cond_merge.drop(columns=cond_overlap)
+    merged_df = merged_df.merge(
+        cond_merge, on=["genome_id", "run_accession"], how="left"
+    )
+
+    # Assign observation status
+    if mode in ("debug", "train"):
+        merged_df = merged_df.merge(
+            STATUS_RULES, on=["feature_status", "run_status"], how="left"
+        )
+        merged_df["status"] = merged_df["status"].fillna("Train")
+
+    genomes_dir = None
+    for cand in ("gbff", "genomes"):
+        p = data_dir / cand
+        if p.is_dir():
+            genomes_dir = p
+            break
+
+    return merged_df, feat_df, cond_df, genomes_dir
+
+
+def write_layout(
+    out_dir: Path,
+    obs_df: pd.DataFrame,
+    feat_df: pd.DataFrame,
+    cond_df: pd.DataFrame,
+    genomes_src: Path = None,
+):
+    """Write output TSV/CSV files using pandas."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    train.to_csv(out_dir / "train_data.tsv", sep="\t", index=False)
-    samples.to_csv(out_dir / "samples.tsv", sep="\t", index=False)
 
-    (out_dir / "public").mkdir(exist_ok=True)
-    public[OBS_COLS].to_csv(
-        out_dir / "public" / "test_data.tsv", sep="\t", index=False)
-    public[["counts"]].to_csv(out_dir / "public" / "labels.csv", index=False)
+    # Train partition
+    train_df = obs_df[obs_df["status"] == "Train"]
+    if not train_df.empty:
+        train_df.to_csv(out_dir / "train_data.tsv", sep="\t", index=False)
 
-    (out_dir / "private").mkdir(exist_ok=True)
-    priv_cols = OBS_COLS + ["group"]
-    private[priv_cols].to_csv(
-        out_dir / "private" / "test_data.tsv", sep="\t", index=False)
-    private[["counts", "group"]].to_csv(
-        out_dir / "private" / "labels.csv", index=False)
+    # Annotations
+    if not feat_df.empty:
+        feat_df.to_csv(
+            out_dir / "feature_annotations.tsv", sep="\t", index=False
+        )
+    if not cond_df.empty:
+        cond_df.to_csv(
+            out_dir / "condition_annotations.tsv", sep="\t", index=False
+        )
 
-    if genomes_src is not None:
-        import shutil
+    # Test splits: A, B, C, D
+    counts = {}
+    for split_name in ("A", "B", "C", "D"):
+        split_df = obs_df[obs_df["status"] == split_name]
+        counts[split_name] = len(split_df)
+        split_dir = out_dir / split_name
+        split_dir.mkdir(parents=True, exist_ok=True)
+        if not split_df.empty:
+            feat_cols = [
+                c for c in split_df.columns if c not in ("readcount", "status")
+            ]
+            split_df[feat_cols].to_csv(
+                split_dir / "test_data.tsv", sep="\t", index=False
+            )
+            split_df[["readcount"]].to_csv(
+                split_dir / "labels.csv", index=False
+            )
+
+    # Copy genomes if available
+    if genomes_src is not None and genomes_src.is_dir():
         dst = out_dir / "genomes"
         dst.mkdir(exist_ok=True)
-        for gb in Path(genomes_src).glob("*.gb"):
-            shutil.copyfile(gb, dst / gb.name)
-    print(f"[setup_data] wrote {out_dir}  "
-          f"(train={len(train)}, public={len(public)}, "
-          f"private={len(private)})")
+        for g_file in sorted(genomes_src.glob("*")):
+            if g_file.suffix in (".gb", ".gbff", ".fna", ".fasta"):
+                dst_file = dst / g_file.name
+                if not dst_file.exists():
+                    shutil.copyfile(g_file, dst_file)
 
-
-def load_raw():
-    """Load the assembled multi-species table + samples + genomes dir.
-
-    Fill this in once the real files are available (they are expected to match
-    the getting-started notebook schema). Must return
-    ``(obs_df, samples_df, genomes_dir)``.
-    """
-    raise NotImplementedError(
-        "Point load_raw at the assembled files (train/test tables, "
-        "samples.tsv, genomes/) and set TRAIN/NEAR/FAR_SPECIES."
+    print(
+        f"[setup_data] wrote {out_dir} (train={len(train_df)}, "
+        f"{', '.join(f'{k}={v}' for k, v in counts.items())})"
     )
 
 
-def make_demo(seed=0):
-    """Tiny synthetic dataset in the exact layout, with small genomes."""
-    from Bio.Seq import Seq
-    from Bio.SeqRecord import SeqRecord
-
+def make_demo_data(seed: int = 0):
+    """Synthetic dataset for smoke tests (using numpy and pandas)."""
     rng = np.random.default_rng(seed)
-    references = TRAIN_SPECIES + NEAR_SPECIES + FAR_SPECIES
-    media = ["M9", "LB", "MOPS"]
-    culture = ["batch", "chemostat"]
+    species_list = [
+        "Escherichia_coli",
+        "Pseudomonas_putida",
+        "Bacillus_subtilis",
+    ]
+    genomes = [f"GCF_{i:09d}.1" for i in range(1, 4)]
+    runs = [f"SRR{i:07d}" for i in range(1, 21)]
 
-    # Studies own their condition_split (whole-study holdout); samples belong
-    # to a study.
-    n_studies = 8
-    study_split = {f"study{j}": ("test" if rng.random() < 0.4 else "train")
-                   for j in range(n_studies)}
-    n_samples = 90
-    sample_study = {}
-    samples = pd.DataFrame({
-        "Run": [f"SRR{i:04d}" for i in range(n_samples)],
-        "Base Media": rng.choice(media, n_samples),
-        "Culture Type": rng.choice(culture, n_samples),
-        "pH": rng.normal(7.0, 0.4, n_samples),
-        "Temperature (C)": rng.choice([30.0, 37.0, 42.0], n_samples),
-        "Growth Rate (1/hr)": np.abs(rng.normal(0.6, 0.2, n_samples)),
-    })
-    for run in samples["Run"]:
-        sample_study[run] = f"study{int(rng.integers(0, n_studies))}"
+    # Conditions
+    cond_species = [rng.choice(species_list) for _ in runs]
+    cond_genomes = [genomes[species_list.index(sp)] for sp in cond_species]
+    split_status = ["train", "test_partial", "test_full"]
+    cond_status = rng.choice(split_status, len(runs), p=[0.5, 0.3, 0.2])
+    log_sf = rng.normal(0.0, 0.3, len(runs))
 
-    # Ortholog groups own their feature_split (gene-set partition); each is a
-    # gene in every species (orthologs share the id across references).
-    n_og = 150
-    og_split = {f"OG{g:03d}": ("test" if rng.random() < 0.4 else "train")
-                for g in range(n_og)}
+    cond_df = pd.DataFrame(
+        {
+            "species": cond_species,
+            "genome_id": cond_genomes,
+            "prj_accession": "PRJNA001",
+            "run_accession": runs,
+            "status": cond_status,
+            "log_size_factor": log_sf,
+        }
+    )
 
-    rows, genomes = [], {}
-    for ref in references:
-        glen = 20000
-        genomes[ref] = SeqRecord(
-            Seq("".join(rng.choice(list("ACGT"), glen))),
-            id=f"{ref}.1", name=ref, description=f"demo {ref}",
-            annotations={"molecule_type": "DNA"})
-        for g in range(n_og):
-            og = f"OG{g:03d}"
-            length = int(rng.integers(200, 3000))
-            start = int(rng.integers(300, glen - 3000))
-            for _ in range(int(rng.integers(4, 10))):
-                run = samples["Run"].iloc[int(rng.integers(0, n_samples))]
-                study = sample_study[run]
-                rows.append({
-                    "Geneid": f"{ref}_{og}", "run_accession": run,
-                    "reference": ref, "Chr": f"{ref}.1",
-                    "Start": start, "End": start + length, "Strand":
-                    rng.choice(["+", "-"]), "Length": float(length),
-                    "log_length_ratio": float(np.log(length) - 7.0),
-                    "log_size_factor": float(rng.normal(0, 0.3)),
-                    "feature_split": og_split[og],
-                    "condition_split": study_split[study],
-                    "ortholog_group": og, "study": study,
-                })
-    obs = pd.DataFrame(rows).drop_duplicates(["Geneid", "run_accession"])
-    obs = obs.reset_index(drop=True)
+    # Features
+    feat_records = []
+    for g in genomes:
+        sp = species_list[genomes.index(g)]
+        for f_idx in range(1, 31):
+            fid = f"cds-WP_{g}_{f_idx:03d}"
+            length = int(rng.integers(300, 2500))
+            status = rng.choice(split_status, p=[0.5, 0.3, 0.2])
+            feat_records.append(
+                {
+                    "species": sp,
+                    "genome_id": g,
+                    "feature_id": fid,
+                    "ref_genome_id": g,
+                    "ref_feature_id": fid,
+                    "Chr": f"NC_{g}",
+                    "Start": f_idx * 1000,
+                    "End": f_idx * 1000 + length,
+                    "Strand": "+",
+                    "Length": float(length),
+                    "homology": 100.0,
+                    "on_contig_edge": False,
+                    "status": status,
+                    "log_length_ratio": math.log(length) - 6.9,
+                }
+            )
+    feat_df = pd.DataFrame(feat_records)
 
-    # Counts: feature/sample driven, shifted for held-out species.
-    s = samples.set_index("Run").loc[obs["run_accession"]]
-    shift = np.where(obs["reference"].isin(FAR_SPECIES), 1.0,
-                     np.where(obs["reference"].isin(NEAR_SPECIES), 0.3, 0.0))
-    log_mu = (3.0 + shift
-              + 0.9 * (obs["log_length_ratio"].values)
-              + 1.5 * (s["Growth Rate (1/hr)"].values - 0.6)
-              - 0.7 * (s["pH"].values - 7.0)
-              + obs["log_size_factor"].values
-              + rng.normal(0, 0.15, len(obs)))
-    mu = np.exp(np.clip(log_mu, -2, 9))
-    obs["counts"] = rng.negative_binomial(8.0, 8.0 / (8.0 + mu))
-    return obs, samples, genomes
+    # Observations
+    obs_df = cond_df.merge(
+        feat_df, on=["species", "genome_id"], suffixes=("_run", "_feat")
+    )
+    obs_df = obs_df.rename(
+        columns={"status_feat": "feature_status", "status_run": "run_status"}
+    ).merge(STATUS_RULES, on=["feature_status", "run_status"], how="left")
+    obs_df["gene_uid"] = obs_df["genome_id"] + "_" + obs_df["feature_id"]
+    obs_df["condition_uid"] = (
+        obs_df["genome_id"] + "_" + obs_df["run_accession"]
+    )
+
+    log_mu = (
+        4.0
+        + obs_df["log_length_ratio"]
+        + obs_df["log_size_factor"]
+        + rng.normal(0, 0.2, len(obs_df))
+    )
+    mu = np.exp(np.clip(log_mu, 0.0, 10.0))
+    counts = np.maximum(0.0, rng.normal(mu, np.sqrt(mu + 0.2 * mu * mu)))
+    obs_df["readcount"] = np.round(counts, 1)
+
+    return obs_df, feat_df, cond_df, None
 
 
 def main():
     parser = argparse.ArgumentParser(description="Build competition splits")
-    parser.add_argument("--demo", action="store_true",
-                        help="generate a tiny synthetic dataset")
-    parser.add_argument("--out", default=str(OUT_DIR))
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--mode",
+        choices=["debug", "train", "full", "all"],
+        default="debug",
+        help="Dataset mode to build: debug, train, full, or all "
+        "(default: debug)",
+    )
+    parser.add_argument(
+        "--demo", action="store_true", help="generate a tiny synthetic dataset"
+    )
+    parser.add_argument(
+        "--data-dir", default="data", help="source raw data directory"
+    )
+    parser.add_argument(
+        "--out",
+        default=str(OUT_DIR),
+        help="output data directory for benchmark",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="random seed for simulation (default: 42)",
+    )
     args = parser.parse_args()
-    out_dir = Path(args.out)
 
+    out_base = Path(args.out)
     if args.demo:
-        obs, samples, genomes = make_demo(args.seed)
-        train, public, private = build_split(obs)
-        write_layout(out_dir, train, public, private, samples)
-        # write the demo genomes
-        from Bio import SeqIO
-        (out_dir / "genomes").mkdir(exist_ok=True)
-        for ref, rec in genomes.items():
-            SeqIO.write(rec, out_dir / "genomes" / f"{ref}.gb", "genbank")
-    else:
-        obs, samples, genomes_dir = load_raw()
-        train, public, private = build_split(obs)
-        write_layout(out_dir, train, public, private, samples, genomes_dir)
+        obs_df, feat_df, cond_df, genomes_dir = make_demo_data(seed=args.seed)
+        write_layout(out_base, obs_df, feat_df, cond_df, genomes_dir)
+        return
+
+    modes = ["debug", "train", "full"] if args.mode == "all" else [args.mode]
+    for m in modes:
+        try:
+            print(f"[setup_data] processing mode: {m}")
+            obs_df, feat_df, cond_df, genomes_dir = load_raw_data(
+                Path(args.data_dir), mode=m, seed=args.seed
+            )
+            target_dir = out_base / m if out_base.name != m else out_base
+            write_layout(target_dir, obs_df, feat_df, cond_df, genomes_dir)
+        except FileNotFoundError as e:
+            if args.mode == "all":
+                print(f"[setup_data] skipping mode '{m}': {e}")
+            else:
+                raise
 
 
 if __name__ == "__main__":
