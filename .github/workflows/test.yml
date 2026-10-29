@@ -23,9 +23,11 @@ jobs:
       - name: Install
         run: |
           pip install -U pip flake8 pytest
+          # CPU torch first, so requirements.txt keeps it (no CUDA wheels).
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
       - name: Lint
-        run: flake8 . --max-line-length=79 --exclude=.git,worktrees
+        run: flake8 . --max-line-length=79 --exclude=.git,worktrees,__cache__
       - name: benchopt design tests
         run: benchopt test benchmark --skip-install
       - name: Smoke run on Simulated
@@ -33,21 +35,23 @@ jobs:
           benchopt run benchmark -d Simulated -s BaselineNN -s Constant \
             -r 1 --no-cache --no-plot --no-html --no-display
       - name: Build bundle + end-to-end ingestion + scoring (demo data)
+        # One data home for prepare and the bundled benchmark, as /app/data.
+        env:
+          BENCHOPT_DATA_HOME: ${{ github.workspace }}/benchmark/data
         run: |
           python tools/setup_data.py --demo
           python tools/create_bundle.py
           python -c "import zipfile; zipfile.ZipFile('bundle.zip').extractall('_bundle')"
-          export BENCHOPT_DATA_HOME=$PWD/phases/main/input_data/data
+          benchopt prepare benchmark --config phases/main/input_data/config.yaml
           python _bundle/ingestion_program/ingestion.py \
             --submission-dir _bundle/solution \
             --input-data _bundle/main_phase/input_data \
-            --benchmark-dir benchmark \
             --output-dir ingestion_res
           python _bundle/scoring_program/scoring.py \
             --prediction-dir ingestion_res \
             --output-dir scoring_res
           python -c "import json; s=json.load(open('scoring_res/scores.json')); \
-            keys={'nb_nll','mae','r2','nb_nll_A','nb_nll_B','nb_nll_C','nb_nll_D'}; \
+            keys={'nb_nll','mae','r2','nb_nll_A','nb_nll_B','nb_nll_C','nb_nll_D','nb_nll_private'}; \
             assert keys <= set(s), s; print('scores OK:', s)"
 
   docker:

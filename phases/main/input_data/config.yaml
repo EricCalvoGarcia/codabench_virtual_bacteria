@@ -1,7 +1,7 @@
 # Phase config — a native `benchopt run --config` file plus one competition
 # key (`scoring`) read by the scoring program and stripped by ingestion.
 dataset:
-  - BacterialExpression
+  - BacterialExpression[mode=full]
 seed: 42
 no_timeout: true
 scoring:
@@ -9,7 +9,15 @@ scoring:
     nb_nll: objective_nb_nll_challenge
     mae: objective_mae_challenge
     r2: objective_r2_challenge
-    nb_nll_C: objective_nb_nll_C
     nb_nll_A: objective_nb_nll_A
     nb_nll_B: objective_nb_nll_B
+    nb_nll_C: objective_nb_nll_C
     nb_nll_D: objective_nb_nll_D
+    # Private columns (hidden on the leaderboard): the final ranking.
+    nb_nll_private: objective_nb_nll_challenge_private
+    mae_private: objective_mae_challenge_private
+    r2_private: objective_r2_challenge_private
+    nb_nll_A_private: objective_nb_nll_A_private
+    nb_nll_B_private: objective_nb_nll_B_private
+    nb_nll_C_private: objective_nb_nll_C_private
+    nb_nll_D_private: objective_nb_nll_D_private

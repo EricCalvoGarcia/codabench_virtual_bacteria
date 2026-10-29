@@ -5,25 +5,43 @@
 Predict the RNA-seq expression **`counts`** of a gene under a given
 experimental condition, from three sources of information:
 
-1. **gene table** — one row per (gene × sample): genomic coordinates,
-   length, normalization offsets;
-2. **genome** — GenBank `.gb` files; the coordinates index into the DNA
-   sequence (e.g. the promoter region upstream of the gene);
-3. **sample metadata** (`samples.tsv`) — the environment: growth medium,
-   culture type, pH, temperature, growth rate.
+1. **gene table**: one row per gene, with its genomic coordinates, length
+   and normalization offset;
+2. **genome**: one GenBank `.gbff` file per genome, where the coordinates
+   index into the DNA sequence (e.g. the promoter region upstream of the
+   gene);
+3. **run table** (`samples_df`): one row per RNA-seq run, with its curated
+   experimental conditions (growth medium, temperature, pH, oxygen, growth
+   phase, perturbation), empty when unknown.
 
 Your model outputs two numbers per observation, **`mu`** (expected count,
 ≥ 0) and **`sigma`** (Negative-Binomial dispersion, > 0). Submissions are
 ranked by the mean **Negative-Binomial negative log-likelihood** (lower is
-better); MAE and R² on `log1p(counts)` are shown alongside.
+better), with MAE and R² on `log1p(counts)` shown alongside. Each
+observation's loss is capped at 100 nats (a typical one costs about 7), so a
+single catastrophic prediction, such as `mu` near 0 for a highly expressed
+gene, cannot dominate a region. Keep `mu` away from 0 anyway: a capped
+observation still costs 100.
 
 ## The split
 
-- **Public columns** (live feedback): a *new gene × new condition* split on
-  **known** species.
-- **Private / final ranking** (hidden): **held-out species**, reported as
-  *near* and *far* phylogenetic groups. Generalizing to distant species is
-  the challenge — do not overfit the public columns.
+Each gene and each run is either seen in training or held out. The test
+observations fall in four regions, from the easiest to the hardest:
+
+- **A**: a gene and a run both seen in training, but never together;
+- **B**: a new gene, in a run seen in training;
+- **C**: a new run (new experimental condition), for a gene seen in training;
+- **D**: a new gene in a new run.
+
+The ranking uses the NB-NLL averaged over A, B and C. D is shown for
+information.
+
+Each region is split in two halves: half of its observations (A), new genes
+(B, D) or new runs (C) go to a **public** half, the others to a **private**
+half. The
+leaderboard shows your scores on the public half. The final ranking uses the
+private half, hidden until the end of the challenge, so tuning your model to
+the leaderboard does not pay.
 
 ## What you submit
 
@@ -56,13 +74,16 @@ evaluates it. See `solution/submission.py` for a working baseline
 
 ```bash
 pip install -r requirements.txt
-python tools/setup_data.py --demo          # or the real data, when provided
-BENCHOPT_DATA_HOME=phases/main/input_data/data \
-    benchopt run benchmark -d Bacteria -s solution/submission.py
+# downloads the training data, then scores on simulated A/B/C/D regions
+# (mode=debug for a small subsample)
+benchopt prepare benchmark -d "BacterialExpression[mode=train]"
+benchopt run benchmark -d "BacterialExpression[mode=train]" \
+    -s solution/submission.py
 ```
 
-The number you get locally on the public split is the number the leaderboard
-shows — the benchmark you run *is* the benchmark the server runs.
+Locally, the regions are drawn from the training data, so your scores follow
+the same protocol as the leaderboard. The benchmark you run *is* the
+benchmark the server runs.
 
 ## Ideas to improve the baseline
 
