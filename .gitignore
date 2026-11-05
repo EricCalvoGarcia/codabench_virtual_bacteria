@@ -12,3 +12,5 @@ data/
 _bundle/
 ingestion_res/
 scoring_res/
+# virtual environment
+.venv
